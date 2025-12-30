@@ -212,6 +212,7 @@ def generate_step(
     pixel_values,
     mask,
     *,
+    logits_processors: Optional[List[Any]] = None,
     max_tokens: int = 256,
     temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
@@ -253,11 +254,23 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
+    def _apply_logits_processors(
+        processors: Optional[List[Any]],
+        input_tokens: mx.array,
+        logits: mx.array,
+    ) -> mx.array:
+        if not processors:
+            return logits
+        for processor in processors:
+            logits = processor(input_tokens, logits)
+        return logits
+
+    def sample(logits: mx.array, input_tokens: mx.array) -> Tuple[mx.array, float]:
         if logit_bias:
             indices = mx.array(list(logit_bias.keys()))
             values = mx.array(list(logit_bias.values()))
             logits[:, indices] += values
+        logits = _apply_logits_processors(logits_processors, input_tokens, logits)
         logprobs = logits - mx.logsumexp(logits)
 
         if temperature == 0:
@@ -287,6 +300,7 @@ def generate_step(
         )
 
     repetition_context = input_ids.reshape(-1).tolist()
+    token_history = input_ids.reshape(-1).tolist()
 
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
@@ -312,14 +326,16 @@ def generate_step(
                 logits = apply_repetition_penalty(
                     logits, repetition_context, repetition_penalty
                 )
-                y, logprobs = sample(logits)
+                y, logprobs = sample(logits, mx.array([token_history], dtype=input_ids.dtype))
                 repetition_context.append(y.item())
             else:
-                y, logprobs = sample(logits)
+                y, logprobs = sample(logits, mx.array([token_history], dtype=input_ids.dtype))
 
             if repetition_context_size:
                 if len(repetition_context) > repetition_context_size:
                     repetition_context = repetition_context[-repetition_context_size:]
+
+            token_history.append(y.item())
 
             quantize_cache_fn(prompt_cache)
             return y, logprobs.squeeze(0)
@@ -328,7 +344,8 @@ def generate_step(
 
     logits = outputs.logits[:, -1, :]
     quantize_cache_fn(prompt_cache)
-    y, logprobs = sample(logits)
+    y, logprobs = sample(logits, input_ids)
+    token_history.append(y.item())
     mx.async_eval(y)
 
     if outputs.cross_attention_states is not None:
