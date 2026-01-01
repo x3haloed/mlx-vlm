@@ -110,12 +110,19 @@ class Dataset:
         if mask is None:
             mask = mx.ones_like(input_ids)
 
-        return {
+        output = {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "attention_mask": mask,
             **kwargs,
         }
+        example_weight = item.get("example_weight", item.get("sample_weight", item.get("weight")))
+        if example_weight is not None:
+            if isinstance(example_weight, list):
+                output["example_weight"] = mx.array(example_weight)
+            else:
+                output["example_weight"] = mx.array([float(example_weight)])
+        return output
 
 
 def grad_checkpoint(layer):
@@ -223,10 +230,11 @@ class Trainer:
 
         input_ids = input_ids[:, :-1]
 
+        example_weight = batch.get("example_weight")
         kwargs = {
             k: v
             for k, v in batch.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
+            if k not in ["input_ids", "pixel_values", "attention_mask", "example_weight"]
         }
 
         # Forward pass
@@ -258,8 +266,14 @@ class Trainer:
             )
             * length_mask
         )
-        ntoks = length_mask.sum()
-        ce = ce.sum() / ntoks
+        if example_weight is not None:
+            if len(example_weight.shape) == 1:
+                example_weight = mx.expand_dims(example_weight, axis=1)
+            ce = ce * example_weight
+            denom = (length_mask * example_weight).sum()
+        else:
+            denom = length_mask.sum()
+        ce = ce.sum() / mx.maximum(denom, 1)
 
         return ce
 
