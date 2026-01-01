@@ -29,7 +29,22 @@ def main(args):
     image_processor = load_image_processor(args.model_path)
 
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    dataset = load_dataset(args.dataset, split=args.split)
+    if os.path.isfile(args.dataset):
+        dataset = load_dataset("json", data_files=args.dataset, split=args.split)
+    elif os.path.isdir(args.dataset):
+        data_files = {}
+        for split_name in ("train", "valid", "test"):
+            for ext in ("jsonl", "json"):
+                candidate = os.path.join(args.dataset, f"{split_name}.{ext}")
+                if os.path.exists(candidate):
+                    data_files[split_name] = candidate
+                    break
+        if data_files:
+            dataset = load_dataset("json", data_files=data_files, split=args.split)
+        else:
+            dataset = load_dataset(args.dataset, split=args.split)
+    else:
+        dataset = load_dataset(args.dataset, split=args.split)
 
     if "messages" not in dataset.column_names:
         raise ValueError("Dataset must have a 'messages' column")
