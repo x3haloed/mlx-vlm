@@ -795,38 +795,14 @@ def prepare_inputs(
     add_special_tokens=False,
     **kwargs,
 ):
-    def _empty_image_list(value) -> bool:
-        if not isinstance(value, list):
-            return False
-        if len(value) == 0:
-            return True
-        for item in value:
-            if item is None:
-                continue
-            if isinstance(item, str) and item == "":
-                continue
-            if isinstance(item, list) and len(item) == 0:
-                continue
-            return False
-        return True
-
-    if _empty_image_list(images):
-        images = None
 
     if not images and not audio:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None):
-            tokenizer.pad_token = tokenizer.eos_token
-        inputs = tokenizer(
-            prompts,
-            add_special_tokens=add_special_tokens,
-            padding=True,
-            truncation=True,
-        )
-        input_ids = mx.array(inputs.input_ids).astype(mx.int32)
-        mask = mx.array(inputs.attention_mask).astype(mx.int32)
+        inputs = tokenizer(prompts, add_special_tokens=add_special_tokens)
+        input_ids = mx.array([inputs.input_ids])
+        mask = mx.array([inputs.attention_mask])
         return {
             "input_ids": input_ids,
             "attention_mask": mask,

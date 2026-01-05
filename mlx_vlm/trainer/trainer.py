@@ -9,10 +9,6 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
-# NOTE: This trainer supports trajectory-aware sleep training.
-# - Standard SFT batches may include example_weight derived from future outcome g(O_t)
-# - Preference batches use (preferred_input_ids, rejected_input_ids) for DPO-style loss
-
 
 def get_prompt(model_type, processor, conversation):
     if model_type == "paligemma":
@@ -63,64 +59,34 @@ class Dataset:
         from mlx_vlm.utils import prepare_inputs
 
         item = self.dataset[idx]
-        batch_items = item if isinstance(item, list) else [item]
 
-        images = []
-        conversations = []
-        for entry in batch_items:
-            images.append(entry.get("images", entry.get("image", None)))
-            conv = entry.get("messages", entry.get("conversations"))
-            if conv is None:
-                conv = []
-            if isinstance(conv, str):
-                conv = [{"role": "user", "content": conv}]
-            elif isinstance(conv, dict):
-                conv = [conv]
-            conversations.append(conv)
-        if len(images) == 1:
-            images = images[0]
+        images = item.get("images", item.get("image", None))
+        conversations = item.get("messages", item.get("conversations"))
         if images in (None, "", []):
-            images = None
-        if isinstance(images, list) and len(images) == 0:
-            images = None
-        if isinstance(images, list):
-            empty = True
-            for item in images:
-                if item is None:
-                    continue
-                if isinstance(item, str) and item == "":
-                    continue
-                if isinstance(item, list) and len(item) == 0:
-                    continue
-                empty = False
-                break
-            if empty:
-                images = None
+            images = []
         prompts = []
 
-        for idx_offset, conversation in enumerate(conversations):
-            if not conversation:
-                warnings.warn(f"Skipping empty conversation at batch index {idx_offset}")
-                continue
+        if isinstance(conversations, list) and isinstance(conversations[0], list):
+            for conversation in conversations:
+                if self.config["model_type"] == "pixtral":
+                    conversation = [json.loads(i) for i in conversation]
+                    if len(conversations) > 1:
+                        warnings.warn(
+                            "Pixtral batch processing is not supported yet. Set batch size to 1."
+                        )
+
+                prompt = get_prompt(
+                    self.config["model_type"], self.processor, conversation
+                )
+                prompts.append(prompt)
+
+        else:
             if self.config["model_type"] == "pixtral":
-                conversation = [json.loads(i) for i in conversation]
-                if len(conversations) > 1:
-                    warnings.warn(
-                        "Pixtral batch processing is not supported yet. Set batch size to 1."
-                    )
+                conversations = [json.loads(i) for i in conversations]
             prompt = get_prompt(
-                self.config["model_type"], self.processor, conversation
+                self.config["model_type"], self.processor, conversations
             )
-            if not isinstance(prompt, str):
-                prompt = json.dumps(prompt, ensure_ascii=False)
             prompts.append(prompt)
-        if not prompts:
-            warnings.warn("All conversations in batch were empty; skipping batch.")
-            return {
-                "input_ids": mx.array([], dtype=mx.int32),
-                "attention_mask": mx.array([], dtype=mx.int32),
-                "pixel_values": None,
-            }
 
         image_token_index = self.config["image_token_index"]
 
@@ -132,15 +98,8 @@ class Dataset:
             image_token_index=image_token_index,
             resize_shape=self.image_resize_shape,
         )
-        if "input_ids" in inputs and inputs["input_ids"].size == 0:
-            warnings.warn("Empty input_ids after tokenization; skipping batch.")
-            return {
-                "input_ids": mx.array([], dtype=mx.int32),
-                "attention_mask": mx.array([], dtype=mx.int32),
-                "pixel_values": None,
-            }
         input_ids = inputs["input_ids"]
-        pixel_values = inputs.get("pixel_values")
+        pixel_values = inputs["pixel_values"]
         mask = inputs["attention_mask"]
         kwargs = {
             k: v
@@ -151,31 +110,12 @@ class Dataset:
         if mask is None:
             mask = mx.ones_like(input_ids)
 
-        output = {
+        return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "attention_mask": mask,
             **kwargs,
         }
-        example_weight = None
-        if isinstance(item, list):
-            weights = []
-            for entry in batch_items:
-                weights.append(entry.get("example_weight", entry.get("sample_weight", entry.get("weight"))))
-            example_weight = weights
-        else:
-            example_weight = item.get("example_weight", item.get("sample_weight", item.get("weight")))
-        if example_weight is not None:
-            if isinstance(example_weight, list):
-                output["example_weight"] = mx.array(example_weight)
-            else:
-                output["example_weight"] = mx.array([float(example_weight)])
-        # Optional preference learning support (trajectory-aware sleep)
-        # Expect keys: preferred_input_ids / rejected_input_ids (already tokenized)
-        if "preferred_input_ids" in item and "rejected_input_ids" in item:
-            output["preferred_input_ids"] = mx.array(item["preferred_input_ids"])
-            output["rejected_input_ids"] = mx.array(item["rejected_input_ids"])
-        return output
 
 
 def grad_checkpoint(layer):
@@ -255,31 +195,11 @@ class Trainer:
         self.assistant_id = assistant_id
         self.clip_gradients = clip_gradients
 
-    def preference_loss(self, model, batch):
-        """DPO-style preference loss for trajectory-aware sleep."""
-        pref_ids = batch["preferred_input_ids"]
-        rej_ids = batch["rejected_input_ids"]
-
-        def score(input_ids):
-            logits = model(input_ids).logits.astype(mx.float32)
-            labels = input_ids[:, 1:]
-            logits = logits[:, :-1, :]
-            ce = nn.losses.cross_entropy(logits, labels)
-            return -ce.mean(axis=1)  # higher is better
-
-        s_pref = score(pref_ids)
-        s_rej = score(rej_ids)
-
-        # DPO-style objective: maximize preference margin
-        return -mx.mean(mx.log(mx.sigmoid(s_pref - s_rej)))
-
     def loss_fn(self, model, batch):
-        # Trajectory-aware preference batch
-        if "preferred_input_ids" in batch and "rejected_input_ids" in batch:
-            return self.preference_loss(model, batch)
         pixel_values = batch["pixel_values"]
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
+        lengths = mx.sum(attention_mask, axis=1)
         labels = input_ids[:, 1:]
 
         batch_size, seq_length = input_ids.shape
@@ -302,15 +222,11 @@ class Trainer:
             weight_mask = None
 
         input_ids = input_ids[:, :-1]
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, :-1]
-        lengths = mx.sum(attention_mask, axis=1)
-        # example_weight is assumed to already encode future-outcome quality g(O_t)
-        example_weight = batch.get("example_weight")
+
         kwargs = {
             k: v
             for k, v in batch.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask", "example_weight"]
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
 
         # Forward pass
@@ -342,29 +258,12 @@ class Trainer:
             )
             * length_mask
         )
-        if example_weight is not None:
-            if example_weight.shape[0] != ce.shape[0]:
-                print(
-                    f"[debug] example_weight shape={example_weight.shape} batch={ce.shape[0]}"
-                )
-                example_weight = example_weight[: ce.shape[0]]
-            if len(example_weight.shape) > 1:
-                example_weight = mx.squeeze(example_weight)
-            example_weight = mx.expand_dims(example_weight, axis=1)
-            ce = ce * example_weight
-            denom = (length_mask * example_weight).sum()
-        else:
-            denom = length_mask.sum()
-        ce = ce.sum() / mx.maximum(denom, 1)
+        ntoks = length_mask.sum()
+        ce = ce.sum() / ntoks
 
         return ce
 
     def train_step(self, batch):
-        if batch.get("input_ids") is not None and batch["input_ids"].size == 0:
-            return mx.array(0.0)
-        # Optional safety: prevent mixing preference + SFT in same batch
-        if "preferred_input_ids" in batch and "input_ids" in batch:
-            raise ValueError("Batch must be either SFT or preference, not both")
         loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
         loss, grads = loss_and_grad_fn(self.model, batch)
 

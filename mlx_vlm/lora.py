@@ -1,14 +1,16 @@
 import argparse
+import importlib
 import json
 import logging
 import os
+from typing import Any, Dict, Optional
 
 import mlx.optimizers as optim
 from datasets import load_dataset
 from tqdm import tqdm
 
 from .prompt_utils import apply_chat_template
-from .trainer import Dataset, Trainer, save_adapter
+from .trainer import save_adapter
 from .trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
 from .utils import load, load_image_processor
 
@@ -18,6 +20,45 @@ logger = logging.getLogger(__name__)
 
 def custom_print(*args, **kwargs):
     tqdm.write(" ".join(map(str, args)), **kwargs)
+
+
+def _load_class(path: str, *, flag_name: str):
+    if ":" in path:
+        module_path, class_name = path.split(":", 1)
+    elif "." in path:
+        module_path, class_name = path.rsplit(".", 1)
+    else:
+        raise ValueError(
+            f"{flag_name} must be a module path like pkg.module.Class or pkg.module:Class"
+        )
+    module = importlib.import_module(module_path)
+    return getattr(module, class_name)
+
+
+def _load_trainer_class(path: str):
+    return _load_class(path, flag_name="--trainer-class")
+
+
+def _load_dataset_class(path: str):
+    return _load_class(path, flag_name="--dataset-class")
+
+
+def _load_trainer_kwargs(raw: Optional[str]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("--trainer-kwargs must be a JSON object")
+    return payload
+
+
+def _load_dataset_kwargs(raw: Optional[str]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("--dataset-kwargs must be a JSON object")
+    return payload
 
 
 def main(args):
@@ -76,12 +117,15 @@ def main(args):
 
         dataset = dataset.map(process_data)
 
-    dataset = Dataset(
+    dataset_cls = _load_dataset_class(args.dataset_class)
+    dataset_kwargs = _load_dataset_kwargs(args.dataset_kwargs)
+    dataset = dataset_cls(
         dataset,
         config,
         processor,
         image_processor=image_processor,
         image_resize_shape=args.image_resize_shape,
+        **dataset_kwargs,
     )
 
     adapter_path = args.adapter_path
@@ -109,7 +153,9 @@ def main(args):
     optimizer = optim.Adam(learning_rate=args.learning_rate)
 
     logger.info(f"\033[32mSetting up trainer\033[0m")
-    trainer = Trainer(model, optimizer)
+    trainer_cls = _load_trainer_class(args.trainer_class)
+    trainer_kwargs = _load_trainer_kwargs(args.trainer_kwargs)
+    trainer = trainer_cls(model, optimizer, **trainer_kwargs)
 
     model.train()
 
@@ -216,6 +262,30 @@ if __name__ == "__main__":
         "--save-after-epoch",
         action="store_true",
         help="Save interim versions of adapter files after each epoch",
+    )
+    parser.add_argument(
+        "--dataset-class",
+        type=str,
+        default="mlx_vlm.trainer.trainer.Dataset",
+        help="Dotted path or module:Class for a custom dataset",
+    )
+    parser.add_argument(
+        "--dataset-kwargs",
+        type=str,
+        default=None,
+        help="JSON dict of kwargs passed to the dataset constructor",
+    )
+    parser.add_argument(
+        "--trainer-class",
+        type=str,
+        default="mlx_vlm.trainer.trainer.Trainer",
+        help="Dotted path or module:Class for a custom trainer",
+    )
+    parser.add_argument(
+        "--trainer-kwargs",
+        type=str,
+        default=None,
+        help="JSON dict of kwargs passed to the trainer constructor",
     )
 
     args = parser.parse_args()
