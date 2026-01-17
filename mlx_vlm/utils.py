@@ -367,6 +367,14 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
+
+    patched_config = _patched_tokenizer_config(model_path)
+    if patched_config is not None and "tokenizer_config" not in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["tokenizer_config"] = patched_config
+
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
@@ -392,6 +400,27 @@ def load_processor(
             processor.stopping_criteria = criteria
 
     return processor
+
+
+def _patched_tokenizer_config(model_path: Path) -> Optional[dict]:
+    """
+    Repair invalid tokenizer configs that set extra_special_tokens as a list.
+    """
+    config_path = model_path / "tokenizer_config.json"
+    if not config_path.exists():
+        return None
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get("extra_special_tokens"), list):
+        patched = dict(data)
+        patched.pop("extra_special_tokens", None)
+        return patched
+    return None
 
 
 def fetch_from_hub(
