@@ -211,6 +211,7 @@ def generate_step(
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    logits_processors: Optional[List[Any]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
     kv_bits: Optional[int] = None,
@@ -246,11 +247,25 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
+    sequence_ids = input_ids.reshape(-1).tolist() if logits_processors else None
+
+    def sample(
+        logits: mx.array, input_ids_for_proc: Optional[mx.array] = None
+    ) -> Tuple[mx.array, float]:
         if logit_bias:
             indices = mx.array(list(logit_bias.keys()))
             values = mx.array(list(logit_bias.values()))
             logits[:, indices] += values
+
+        if logits_processors:
+            # Some constrained decoding kernels (e.g., outlines_core MLX bitmask)
+            # do not support bfloat16 logits on all MLX/Metal versions. Cast to
+            # float32 before applying processors to avoid kernel compilation errors.
+            if hasattr(mx, "bfloat16") and logits.dtype == mx.bfloat16:
+                logits = logits.astype(mx.float32)
+            assert input_ids_for_proc is not None
+            for proc in logits_processors:
+                logits = proc(input_ids_for_proc, logits)
         logprobs = logits - mx.logsumexp(logits)
 
         if temperature == 0:
@@ -304,15 +319,25 @@ def generate_step(
                 logits = apply_repetition_penalty(
                     logits, repetition_context, repetition_penalty
                 )
-                y, logprobs = sample(logits)
+                y, logprobs = (
+                    sample(logits, mx.array(sequence_ids))
+                    if sequence_ids is not None
+                    else sample(logits)
+                )
                 repetition_context.append(y.item())
             else:
-                y, logprobs = sample(logits)
+                y, logprobs = (
+                    sample(logits, mx.array(sequence_ids))
+                    if sequence_ids is not None
+                    else sample(logits)
+                )
 
             if repetition_context_size:
                 if len(repetition_context) > repetition_context_size:
                     repetition_context = repetition_context[-repetition_context_size:]
 
+            if sequence_ids is not None:
+                sequence_ids.append(y.item())
             quantize_cache_fn(prompt_cache)
             return y, logprobs.squeeze(0)
 
@@ -320,8 +345,14 @@ def generate_step(
 
     logits = outputs.logits[:, -1, :]
     quantize_cache_fn(prompt_cache)
-    y, logprobs = sample(logits)
+    y, logprobs = (
+        sample(logits, mx.array(sequence_ids))
+        if sequence_ids is not None
+        else sample(logits)
+    )
     mx.async_eval(y)
+    if sequence_ids is not None:
+        sequence_ids.append(y.item())
 
     if outputs.cross_attention_states is not None:
         kwargs = {
@@ -379,6 +410,13 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    logits_processors = kwargs.get("logits_processors")
+    if logits_processors:
+        for proc in logits_processors:
+            reset = getattr(proc, "reset", None)
+            if callable(reset):
+                reset()
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
