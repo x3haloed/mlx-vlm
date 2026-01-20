@@ -27,6 +27,12 @@ from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
 
+try:
+    from hominem_observability.trace import trace_event
+except Exception:  # pragma: no cover
+    def trace_event(*_args, **_kwargs):
+        return
+
 # Constants
 MODEL_REMAPPING = {
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
@@ -830,6 +836,28 @@ def prepare_inputs(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
         inputs = tokenizer(prompts, add_special_tokens=add_special_tokens)
+        try:
+            input_ids_list = list(inputs.input_ids)
+            attention_mask_list = list(getattr(inputs, "attention_mask", []) or [])
+        except Exception:
+            input_ids_list = None
+            attention_mask_list = None
+        try:
+            decoded = tokenizer.decode(input_ids_list) if isinstance(input_ids_list, list) else None
+        except Exception:
+            decoded = None
+        trace_event(
+            "mlx_vlm.tokenizer.encode",
+            {
+                "mode": "text_only",
+                "prompt": prompts,
+                "input_ids_len": (len(input_ids_list) if isinstance(input_ids_list, list) else None),
+                "input_ids": input_ids_list,
+                "attention_mask": attention_mask_list,
+                "decoded": decoded,
+            },
+            source="mlx_vlm",
+        )
         input_ids = mx.array([inputs.input_ids])
         mask = mx.array([inputs.attention_mask])
         return {
@@ -897,6 +925,20 @@ def prepare_inputs(
         model_inputs["attention_mask"] = mx.array(
             [(ids != processor.pad_token_id) for ids in input_ids]
         ).astype(mx.int32)
+        try:
+            first_ids = model_inputs["input_ids"][0].tolist()
+        except Exception:
+            first_ids = None
+        trace_event(
+            "mlx_vlm.tokenizer.encode",
+            {
+                "mode": "image_processor_split",
+                "prompt": prompts,
+                "input_ids_len": (len(first_ids) if isinstance(first_ids, list) else None),
+                "input_ids_first": first_ids,
+            },
+            source="mlx_vlm",
+        )
 
     else:
         if hasattr(processor, "tokenizer"):
@@ -926,6 +968,29 @@ def prepare_inputs(
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
+        try:
+            tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            ids0 = None
+            if "input_ids" in model_inputs:
+                v = model_inputs["input_ids"]
+                if hasattr(v, "tolist"):
+                    ids0 = v[0].tolist() if getattr(v, "ndim", 1) > 1 else v.tolist()
+                elif isinstance(v, list):
+                    ids0 = v[0] if v and isinstance(v[0], list) else v
+            decoded0 = tok.decode(ids0) if (ids0 is not None and hasattr(tok, "decode")) else None
+        except Exception:
+            ids0 = None
+            decoded0 = None
+        trace_event(
+            "mlx_vlm.tokenizer.encode",
+            {
+                "mode": "processor_fallback",
+                "prompt": prompts,
+                "input_ids_first": ids0,
+                "decoded_first": decoded0,
+            },
+            source="mlx_vlm",
+        )
 
     return model_inputs
 
